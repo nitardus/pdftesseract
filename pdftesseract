@@ -1,0 +1,304 @@
+#! /usr/bin/perl
+use v5.14;
+use strict; use warnings;
+
+use Cwd;
+use File::Spec;
+use File::Temp;
+use File::Copy;
+use POSIX;
+#use Data::Dumper;
+
+my ($pdf, $language, $columns, $pages, $print_pagenum, $oem, $dpi, @magickopts, @tessopts);
+
+# EXTERNAL COMMANDS
+sub burst_cmd     { my $name   = shift;
+		    my $base   = $name =~ s/\.pdf$//r;
+		    my $outdir = shift;
+		    my ($first, $last) = @{ shift @_ };
+		    say $first;
+		    say $last;
+		    my $out = File::Spec->catfile($outdir, "${base}_%d.pdf");
+		    return 'pdfseparate', '-f', $first, '-l', $last, $name, $out }
+sub convert_cmd   { return 'magick', 'mogrify', '-density', $dpi,
+		      '-fuzz', '30%', '-format', 'jpg', $_[0] }
+sub split_cmd     { my $jpg      = shift;
+		    my $base     = $jpg =~ s/\.jpg$//r;
+		    my $split    = ($columns<10) ? 100 / $columns : $columns;
+		    my $negsplit = 100 - $split;
+		    return ( $columns<10 or $columns>=50 )
+		      ? ( 'magick', 'convert', $jpg, '-crop', "${split}x100%", "+repage", $jpg )
+		      : "magick convert $jpg -crop ${split}x100% +repage ${base}-1.jpg && "
+ 		      . "magick convert $jpg -gravity NorthEast -crop ${negsplit}x100%+0+0 +repage ${base}-1.jpg";
+		  }
+# sub merge_cmd     { my $jpg      = shift;
+# 		    my $base     = $jpg =~ s/\.jpg$//r;
+# 		    return "magick convert -append ${base}-*.jpg $jpg"; }
+sub tesseract_cmd { my $name = shift;
+		    my $base = $name =~ s/\.jpg$//r;
+		    return 'tesseract', $name, $base, '-l', $language,
+		      '--oem', $oem, '--dpi', $dpi }
+
+# MAIN
+get_opts();
+$columns       = $columns       || 1;
+$print_pagenum = $print_pagenum || 0;
+$oem           = $oem           || 3;
+$dpi           = $dpi           || 300;
+
+my $lastpage    = get_pdf_pages($pdf);
+my @page_ranges = get_page_ranges($pages, $lastpage);
+
+# Make output directory in /tmp
+my $dir = getcwd();
+my $tempdir = File::Temp->newdir();
+-d $tempdir or die "Could not create tempdir $tempdir: $!";
+my $cores = get_nr_of_cores();
+
+for my $range (@page_ranges) {
+  system burst_cmd($pdf, $tempdir, $range);
+}
+chdir $tempdir;
+my @pdfs = glob("*.pdf");
+parallel( $cores, command => \&convert_cmd, files => \@pdfs );
+
+if ($columns > 1) {
+  my @jpgs = glob("*.jpg");
+  parallel( $cores, command => \&split_cmd, files => [ @jpgs ] );
+  # parallel( $cores, command => \&merge_cmd, files => [ @jpgs ] );
+}
+
+my @jpgs = glob("*.jpg");
+parallel( $cores, command => \&tesseract_cmd, files => \@jpgs );
+
+my @txts = sort glob("*.txt");
+my $output = '';
+for my $file (@txts) {
+  undef local $/;
+  open my $fh, '<', $file or warn "$!";
+  if ($print_pagenum) {
+    say STDERR $file;
+    my $page_number = $file;
+    $page_number =~ s/^.*_//;
+    $page_number =~ s/\.txt$//;
+    $output .= "****************************\n";
+    $output .= "$pdf: p. $page_number\n";
+    $output .= "****************************\n\n";
+  }
+  $output .= <$fh> . "\f";
+  close $fh;
+  unlink $file;
+}
+chdir $dir;
+
+print $output;
+
+# # -------------------------------------------------------------------
+# # Functions
+
+sub parallel {
+  my $parallels = shift or die "Missing number of parallels!";
+  $parallels =~ /^\d+/  or die "Invalid number of parallels $parallels!";
+  my %p = ( command   => 0,
+	    files     => 0,
+	    @_ );
+  %p == 2                      or die "Invalid keys in function call!";
+  ref $p{command}   eq 'CODE'  or die "Command $p{command} muat be a coderef!";
+  ref $p{files}     eq 'ARRAY' or die "Files $p{files} must be a arrayref!";
+
+  say STDERR "Executing ", join ' ', $p{command}->( $p{files}[0] );
+  say STDERR "for @{ $p{files} }";
+  my $parent_pid = $$;
+  my %children;
+  do {
+    while (%children < $parallels) {
+      my $file = shift @{ $p{files} } || last;
+      my $pid = fork // die "Cannot fork: $!";
+      unless ($pid) {
+	say STDERR "Child $$: $file";
+	exec $p{command}->($file)
+      }
+      $children{$pid} = $file;
+    }
+
+    for my $child (keys %children) {
+      if (waitpid $child, WNOHANG) {
+	unlink $children{$child};
+	delete $children{$child};
+      }
+    }
+  } while %children;
+  say STDERR "Finished";
+}
+
+sub get_nr_of_cores {
+  for ($^O) {
+    if (/unix/) {
+      open my $handle, "/proc/cpuinfo"
+	or die "Can't open cpuinfo: $!\n";
+      (my $cores = map /^processor/, <$handle>)--;
+      close $handle;
+      return $cores;
+    }
+    # not tested
+    elsif (/win/) {
+      return $ENV{"NUMBER_OF_PROCESSORS"} ;
+    }
+    # not tested
+    elsif (/darwin/) {
+      my @hardinfo = `system_profiler SPHardwareDataType SPSoftwareDataType`;
+      for (@hardinfo) {
+	/^\s+Total Number of Cores\: (.*)$/ and return $1;
+      }
+    }
+    else { return 4 }
+  }
+}
+
+sub get_pdf_pages {
+  my $filename = shift || die "No filename!";
+  my @lines = qx/pdfinfo $filename/;
+  for (@lines) {
+    if (/^Pages:/) {
+      s/\D//g;
+      return $_;
+    }
+  }
+}
+
+sub get_page_ranges {
+  my ($pages, $lastpage) = @_;
+  $pages = $pages || "1-$lastpage";
+  my @ranges = split ',', $pages;
+  for my $range (@ranges) {
+    my ($first, $last, @error) = split '-', $range;
+    $last = $last || $first;
+    die "Invalid page range $range\n"
+      if @error or $first > $last;
+    die "Last page is $lastpage"
+      if $last > $lastpage;
+    $range = [ $first, $last ];
+  }
+  return @ranges;
+}
+
+sub get_opts {
+  while (local $_ = shift @ARGV) {
+    if (/^-/) {			# flags
+      if (/^-h$/ || /^--help$/) { help() }
+      if (/[0-3cn]/) {
+	if (/([0-3])/) {
+	  $oem and die "You cannot specify multiple values for the --oem switch!\n";
+	  $oem = $1;
+	}
+	if (/c/) {
+	  $columns and die "You have specified the columns option twice: I don't know what to do!\n";
+	  $columns   = 2;
+	}
+	if (/P/) {
+	  $print_pagenum = 1;
+	}
+      }
+      if    (/l$/ || /^--language$/) {
+	$language = shift @ARGV or die "You must specify a language to the --language switch!\n";
+	$language =~ /^[-_+A-z]+$/ or die "Invalid language $language\n";
+      }
+      elsif (/d$/ || /^--dpi$/)  {
+	$columns and die "You have specified the columns option twice: I don't know what to do!\n";
+	$dpi = shift @ARGV or die "You must specify a numeric argument to the --dpi switch";
+	$dpi !~ /\D/ or die "The argument to the --dpi switch must be numeric!"
+      }
+      elsif (/s$/ || /^--split$/) {
+	$columns and die "You have specified the columns option twice: I don't know what to do!\n";
+	$columns  = shift @ARGV or die "You must specify a numeric argument to the --split switch";
+	$columns !~ /\D/ && $columns<=100
+	  or die "The argument to the --split switch must be numeric and <= 100!"
+	}
+      elsif (/p$/ || /^--pages$/) {
+	$pages = shift @ARGV or die "You must specify an argument to the --pages switch";
+	$pages =~ /^[-,\d]/
+	  or die "The argument to the --pages switch must be a numeric range!";
+      }
+      # Long versions of -[0-3], -n
+      elsif (/^--oem$/) {
+	$oem and die "You cannot specify multiple values for the --oem switch!\n";
+	$oem = shift @ARGV or die "You must specify a numeric argument to the --oem switch";
+	$oem =~ /^[0-3]/   or die "The argument to the --oem switch must be between 0 and 3!\n";
+      }
+      elsif (/^--pagenum$/) { $print_pagenum = 1 }
+      # --magick and --tesseract
+      elsif (/m$/ || /^--magick$/) {
+	grep { /^-t$/ || /^--tesseract$/ } @ARGV
+	  or die "You have to combine the $_ switch with the -t/--tesseract switch!\n";
+	while (local $_ = shift @ARGV and not /^-t$/ || /^--tesseract$/) {
+	  push @magickopts, $_;
+	}
+	my $last;
+	while (local $_ = shift @ARGV) {
+	  push @tessopts, $_;
+	  $last = $_;
+	}
+	# Last element should hold the filename and gets restituted
+	unshift @ARGV, $last;
+      }
+      else { die "Invalid option $_!\n" }
+    }
+    else {			# plain file name
+      $pdf and die "You can only specify one pdf file!\n";
+      if (s/\[([-,\d]*)\]$//) {
+	$pages and die "You specified the page range twice: I don't know what to do!\n";
+	$pages = $1;
+      }
+      $pdf = $_;
+      $pdf =~ s/^\\// # clear initial backslash for masking PDF files starting with '-'
+    }
+  }
+  die "You have to specify a PDF file to process!\n" unless $pdf;
+  die "You have to specify a language\n" unless $language;
+}
+
+sub help {
+  print <<EOT;
+A simple script that excerpts images from a pdf-file via imagemagick and converts it to text using tesseract.
+
+   USAGE: [-c|P|0|1|2|3] [--columns] [--pagenum] [--oem oem] [-s|--split columns] [-p|--pages pages]
+          [-m|--magick MAGICKOPTIONS --t|--tesseract TESSERACT_OPTIONS]
+          -l|--language language file-name[page-number]
+
+options:
+-[0|1|2|3]               set tesseracts oem to [1-3] (default 1).
+--oem [0|1|2|3]
+
+-c                       set columns to 2.
+--columns
+
+-P                       print the name of both the pdf-file and the processed page into the output document.
+--pagenum
+
+-l language[+language]   sets the language for the document. Multiple languages may be added with '+' signs.
+--language ...
+
+-s columns/split         sets the number of columns present in a document.
+--split
+
+-p pages                 sets the number of pages to be processed (an alternative to file-name[page-number]).
+--pages ...              If the number is > 10, then the number is interpreted as the width (percentage) of the right column
+                         in a two-column document.
+
+-h                       print this help notice
+--help
+EOT
+
+  exit 0;
+}
+
+# For debbuging
+sub print_opts {
+  say "FILENAME: $pdf";
+  say "LANGUAGE: $language";
+  say "COLUMNS:  $columns" if $columns;
+  say "PAGENUM" if $print_pagenum;
+  say "OEM: $oem" if $oem;
+  say "MAGICKOPTS: @magickopts" if @magickopts;
+  say "TESSOPTS: @tessopts" if @tessopts;
+}
