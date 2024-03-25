@@ -16,8 +16,6 @@ sub burst_cmd     { my $name   = shift;
 		    my $base   = $name =~ s/\.pdf$//r;
 		    my $outdir = shift;
 		    my ($first, $last) = @{ shift @_ };
-		    $first;
-		    $last;
 		    my $out = File::Spec->catfile($outdir, "${base}_%d.pdf");
 		    return 'pdfseparate', '-f', $first, '-l', $last, $name, $out }
 sub convert_cmd   { return 'magick', 'mogrify', '-density', $dpi,
