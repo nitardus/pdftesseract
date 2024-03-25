@@ -16,8 +16,8 @@ sub burst_cmd     { my $name   = shift;
 		    my $base   = $name =~ s/\.pdf$//r;
 		    my $outdir = shift;
 		    my ($first, $last) = @{ shift @_ };
-		    say $first;
-		    say $last;
+		    $first;
+		    $last;
 		    my $out = File::Spec->catfile($outdir, "${base}_%d.pdf");
 		    return 'pdfseparate', '-f', $first, '-l', $last, $name, $out }
 sub convert_cmd   { return 'magick', 'mogrify', '-density', $dpi,
@@ -77,7 +77,6 @@ for my $file (@txts) {
   undef local $/;
   open my $fh, '<', $file or warn "$!";
   if ($print_pagenum) {
-    say STDERR $file;
     my $page_number = $file;
     $page_number =~ s/^.*_//;
     $page_number =~ s/\.txt$//;
@@ -294,11 +293,11 @@ EOT
 
 # For debbuging
 sub print_opts {
-  say "FILENAME: $pdf";
-  say "LANGUAGE: $language";
-  say "COLUMNS:  $columns" if $columns;
-  say "PAGENUM" if $print_pagenum;
-  say "OEM: $oem" if $oem;
-  say "MAGICKOPTS: @magickopts" if @magickopts;
-  say "TESSOPTS: @tessopts" if @tessopts;
+  say STDERR "FILENAME: $pdf";
+  say STDERR "LANGUAGE: $language";
+  say STDERR "COLUMNS:  $columns" if $columns;
+  say STDERR "PAGENUM" if $print_pagenum;
+  say STDERR "OEM: $oem" if $oem;
+  say STDERR "MAGICKOPTS: @magickopts" if @magickopts;
+  say STDERR "TESSOPTS: @tessopts" if @tessopts;
 }
